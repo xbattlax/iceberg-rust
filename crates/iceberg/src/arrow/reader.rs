@@ -27,7 +27,8 @@ use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatc
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
-    ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    ArrowError, DataType, Field, FieldRef, Fields, Schema as ArrowSchema,
+    SchemaRef as ArrowSchemaRef,
 };
 use arrow_string::like::starts_with;
 use bytes::Bytes;
@@ -46,7 +47,7 @@ use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
-use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
+use crate::arrow::{ArrowSchemaVisitor, arrow_schema_to_schema, get_arrow_datum, visit_schema};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
@@ -56,6 +57,7 @@ use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
+use crate::spec::MappedField;
 use crate::spec::{Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
@@ -980,24 +982,227 @@ fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32
     column_map
 }
 
-/// Apply name mapping to Arrow schema for Parquet files lacking field IDs.
-///
-/// Assigns Iceberg field IDs based on column names using the name mapping,
-/// enabling correct projection on migrated files (e.g., from Hive/Spark via add_files).
-///
-/// Per Iceberg spec Column Projection rule #2:
-/// "Use schema.name-mapping.default metadata to map field id to columns without field id"
-/// https://iceberg.apache.org/spec/#column-projection
-///
-/// Corresponds to Java's ParquetSchemaUtil.applyNameMapping() and ApplyNameMapping visitor.
-/// The key difference is Java operates on Parquet MessageType, while we operate on Arrow Schema.
-///
-/// # Arguments
-/// * `arrow_schema` - Arrow schema from Parquet file (without field IDs)
-/// * `name_mapping` - Name mapping from table metadata (TableProperties.DEFAULT_NAME_MAPPING)
-///
-/// # Returns
-/// Arrow schema with field IDs assigned based on name mapping
+/// Visitor that applies Iceberg name mapping to Arrow schema, assigning field IDs
+/// based on field names. Handles nested types (struct, list, map) by traversing the
+/// name mapping hierarchy in sync with the Arrow schema structure.
+/// Corresponds to Java's ApplyNameMapping visitor in ParquetSchemaUtil.
+struct ApplyNameMappingVisitor<'a> {
+    /// Root-level mappings from NameMapping (type differs from nested mappings).
+    root_mappings: &'a [MappedField],
+    /// Stack of nested mappings at each level. Empty = use root_mappings.
+    nested_stack: Vec<&'a [Arc<MappedField>]>,
+    /// Stack of field IDs to apply, pushed in before_* hooks, consumed in struct/list/map/schema.
+    field_id_stack: Vec<Option<i32>>,
+}
+
+impl<'a> ApplyNameMappingVisitor<'a> {
+    fn new(name_mapping: &'a NameMapping) -> Self {
+        Self {
+            root_mappings: name_mapping.fields(),
+            nested_stack: Vec::new(),
+            field_id_stack: Vec::new(),
+        }
+    }
+
+    /// Find mapping by name in current level and push field ID + nested mappings to stacks.
+    fn push_mapping_for_name(&mut self, name: &str) {
+        if self.nested_stack.is_empty() {
+            // Search in root mappings
+            if let Some(m) = self
+                .root_mappings
+                .iter()
+                .find(|m| m.names().contains(&name.to_string()))
+            {
+                self.field_id_stack.push(m.field_id());
+                self.nested_stack.push(m.fields());
+            } else {
+                self.field_id_stack.push(None);
+                self.nested_stack.push(&[]);
+            }
+        } else {
+            // Search in current nested level
+            let current = self.nested_stack.last().unwrap();
+            if let Some(m) = current
+                .iter()
+                .find(|m| m.names().contains(&name.to_string()))
+            {
+                self.field_id_stack.push(m.field_id());
+                self.nested_stack.push(m.fields());
+            } else {
+                self.field_id_stack.push(None);
+                self.nested_stack.push(&[]);
+            }
+        }
+    }
+
+    /// Pop from nested stack (called in after_* hooks).
+    fn pop_nested(&mut self) {
+        self.nested_stack.pop();
+    }
+
+    /// Create a new Field with optional field ID in metadata.
+    fn field_with_id(field: &Field, data_type: DataType, field_id: Option<i32>) -> Arc<Field> {
+        let mut metadata = field.metadata().clone();
+        if let Some(id) = field_id {
+            metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+        }
+        Arc::new(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
+    }
+}
+
+impl ArrowSchemaVisitor for ApplyNameMappingVisitor<'_> {
+    type T = DataType;
+    type U = Arc<ArrowSchema>;
+
+    fn before_field(&mut self, field: &Field) -> Result<()> {
+        self.push_mapping_for_name(field.name());
+        Ok(())
+    }
+
+    fn after_field(&mut self, _field: &Field) -> Result<()> {
+        self.pop_nested();
+        Ok(())
+    }
+
+    fn before_list_element(&mut self, _field: &Field) -> Result<()> {
+        // Iceberg uses "element" as the name for list elements in name mapping
+        self.push_mapping_for_name("element");
+        Ok(())
+    }
+
+    fn after_list_element(&mut self, _field: &Field) -> Result<()> {
+        self.pop_nested();
+        Ok(())
+    }
+
+    fn before_map_key(&mut self, _field: &Field) -> Result<()> {
+        // Iceberg uses "key" as the name for map keys in name mapping
+        self.push_mapping_for_name("key");
+        Ok(())
+    }
+
+    fn after_map_key(&mut self, _field: &Field) -> Result<()> {
+        self.pop_nested();
+        Ok(())
+    }
+
+    fn before_map_value(&mut self, _field: &Field) -> Result<()> {
+        // Iceberg uses "value" as the name for map values in name mapping
+        self.push_mapping_for_name("value");
+        Ok(())
+    }
+
+    fn after_map_value(&mut self, _field: &Field) -> Result<()> {
+        self.pop_nested();
+        Ok(())
+    }
+
+    fn schema(&mut self, schema: &ArrowSchema, values: Vec<Self::T>) -> Result<Self::U> {
+        // Collect field IDs for top-level fields (reverse order since stack is LIFO)
+        let field_ids: Vec<_> = (0..values.len())
+            .map(|_| self.field_id_stack.pop().unwrap_or(None))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let new_fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .zip(values)
+            .zip(field_ids)
+            .map(|((field, data_type), field_id)| Self::field_with_id(field, data_type, field_id))
+            .collect();
+
+        Ok(Arc::new(ArrowSchema::new_with_metadata(
+            new_fields,
+            schema.metadata().clone(),
+        )))
+    }
+
+    fn r#struct(&mut self, fields: &Fields, results: Vec<Self::T>) -> Result<Self::T> {
+        // Collect field IDs for struct fields (reverse order since stack is LIFO)
+        let field_ids: Vec<_> = (0..results.len())
+            .map(|_| self.field_id_stack.pop().unwrap_or(None))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let new_fields: Vec<_> = fields
+            .iter()
+            .zip(results)
+            .zip(field_ids)
+            .map(|((field, data_type), field_id)| Self::field_with_id(field, data_type, field_id))
+            .collect();
+
+        Ok(DataType::Struct(Fields::from(new_fields)))
+    }
+
+    fn list(&mut self, list: &DataType, value: Self::T) -> Result<Self::T> {
+        let element_id = self.field_id_stack.pop().unwrap_or(None);
+
+        match list {
+            DataType::List(element_field) => {
+                let new_element = Self::field_with_id(element_field, value, element_id);
+                Ok(DataType::List(new_element))
+            }
+            DataType::LargeList(element_field) => {
+                let new_element = Self::field_with_id(element_field, value, element_id);
+                Ok(DataType::LargeList(new_element))
+            }
+            DataType::FixedSizeList(element_field, size) => {
+                let new_element = Self::field_with_id(element_field, value, element_id);
+                Ok(DataType::FixedSizeList(new_element, *size))
+            }
+            _ => Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Expected list type, got {list}"),
+            )),
+        }
+    }
+
+    fn map(&mut self, map: &DataType, key_value: Self::T, value: Self::T) -> Result<Self::T> {
+        let value_id = self.field_id_stack.pop().unwrap_or(None);
+        let key_id = self.field_id_stack.pop().unwrap_or(None);
+
+        match map {
+            DataType::Map(entries_field, sorted) => {
+                if let DataType::Struct(kv_fields) = entries_field.data_type() {
+                    let key_field = &kv_fields[0];
+                    let value_field = &kv_fields[1];
+
+                    let new_key = Self::field_with_id(key_field, key_value, key_id);
+                    let new_value = Self::field_with_id(value_field, value, value_id);
+
+                    let new_entries = Arc::new(Field::new(
+                        entries_field.name(),
+                        DataType::Struct(Fields::from(vec![new_key, new_value])),
+                        entries_field.is_nullable(),
+                    ));
+
+                    Ok(DataType::Map(new_entries, *sorted))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Map entries field must be struct type",
+                    ))
+                }
+            }
+            _ => Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Expected map type, got {map}"),
+            )),
+        }
+    }
+
+    fn primitive(&mut self, p: &DataType) -> Result<Self::T> {
+        // Primitives don't have nested structure, return as-is
+        Ok(p.clone())
+    }
+}
+
+/// Apply name mapping to Arrow schema using visitor pattern for nested type support.
 fn apply_name_mapping_to_arrow_schema(
     arrow_schema: ArrowSchemaRef,
     name_mapping: &NameMapping,
@@ -1011,43 +1216,8 @@ fn apply_name_mapping_to_arrow_schema(
         "Schema already has field IDs - name mapping should not be applied"
     );
 
-    use arrow_schema::Field;
-
-    let fields_with_mapped_ids: Vec<_> = arrow_schema
-        .fields()
-        .iter()
-        .map(|field| {
-            // Look up this column name in name mapping to get the Iceberg field ID.
-            // Corresponds to Java's ApplyNameMapping visitor which calls
-            // nameMapping.find(currentPath()) and returns field.withId() if found.
-            //
-            // If the field isn't in the mapping, leave it WITHOUT assigning an ID
-            // (matching Java's behavior of returning the field unchanged).
-            // Later, during projection, fields without IDs are filtered out.
-            let mapped_field_opt = name_mapping
-                .fields()
-                .iter()
-                .find(|f| f.names().contains(&field.name().to_string()));
-
-            let mut metadata = field.metadata().clone();
-
-            if let Some(mapped_field) = mapped_field_opt
-                && let Some(field_id) = mapped_field.field_id()
-            {
-                // Field found in mapping with a field_id → assign it
-                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-            }
-            // If field_id is None, leave the field without an ID (will be filtered by projection)
-
-            Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                .with_metadata(metadata)
-        })
-        .collect();
-
-    Ok(Arc::new(ArrowSchema::new_with_metadata(
-        fields_with_mapped_ids,
-        arrow_schema.metadata().clone(),
-    )))
+    let mut visitor = ApplyNameMappingVisitor::new(name_mapping);
+    visit_schema(&arrow_schema, &mut visitor)
 }
 
 /// Add position-based fallback field IDs to Arrow schema for Parquet files lacking them.
@@ -1993,27 +2163,30 @@ message schema {
     async fn test_predicate_cast_literal() {
         let predicates = vec![
             // a == 'foo'
-            (Reference::new("a").equal_to(Datum::string("foo")), vec![
-                Some("foo".to_string()),
-            ]),
+            (
+                Reference::new("a").equal_to(Datum::string("foo")),
+                vec![Some("foo".to_string())],
+            ),
             // a != 'foo'
             (
                 Reference::new("a").not_equal_to(Datum::string("foo")),
                 vec![Some("bar".to_string())],
             ),
             // STARTS_WITH(a, 'foo')
-            (Reference::new("a").starts_with(Datum::string("f")), vec![
-                Some("foo".to_string()),
-            ]),
+            (
+                Reference::new("a").starts_with(Datum::string("f")),
+                vec![Some("foo".to_string())],
+            ),
             // NOT STARTS_WITH(a, 'foo')
             (
                 Reference::new("a").not_starts_with(Datum::string("f")),
                 vec![Some("bar".to_string())],
             ),
             // a < 'foo'
-            (Reference::new("a").less_than(Datum::string("foo")), vec![
-                Some("bar".to_string()),
-            ]),
+            (
+                Reference::new("a").less_than(Datum::string("foo")),
+                vec![Some("bar".to_string())],
+            ),
             // a <= 'foo'
             (
                 Reference::new("a").less_than_or_equal_to(Datum::string("foo")),
@@ -2325,17 +2498,20 @@ message schema {
         let file_path = format!("{table_location}/multi_row_group.parquet");
 
         // Force each batch into its own row group for testing byte range filtering.
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (0..100).collect::<Vec<i32>>(),
-        ))])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+        )
         .unwrap();
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (100..200).collect::<Vec<i32>>(),
-        ))])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((100..200).collect::<Vec<i32>>()))],
+        )
         .unwrap();
-        let batch3 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (200..300).collect::<Vec<i32>>(),
-        ))])
+        let batch3 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((200..300).collect::<Vec<i32>>()))],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -2637,14 +2813,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -2683,10 +2861,13 @@ message schema {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![199i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![199i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -2831,14 +3012,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -2877,10 +3060,13 @@ message schema {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![199i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![199i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -3053,14 +3239,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -3099,10 +3287,13 @@ message schema {
         ]));
 
         // Delete row at position 0 (0-indexed, so it's the first row: id=1)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![0i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![0i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -3321,9 +3512,10 @@ message schema {
         let col3_data = Arc::new(StringArray::from(vec!["c", "d"])) as ArrayRef;
         let col4_data = Arc::new(Int32Array::from(vec![30, 40])) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col1_data, col2_data, col3_data, col4_data,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![col1_data, col2_data, col3_data, col4_data],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -4051,5 +4243,262 @@ message schema {
         assert_eq!(name_col.value(1), "Bob");
         assert_eq!(name_col.value(2), "Charlie");
         assert_eq!(name_col.value(3), "Dave");
+    }
+
+    mod name_mapping_tests {
+        use std::sync::Arc;
+
+        use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+
+        use crate::arrow::reader::{PARQUET_FIELD_ID_META_KEY, apply_name_mapping_to_arrow_schema};
+        use crate::spec::{MappedField, NameMapping};
+
+        fn get_field_id(field: &Field) -> Option<i32> {
+            field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .and_then(|v| v.parse().ok())
+        }
+
+        #[test]
+        fn test_apply_name_mapping_flat_schema() {
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+
+            let name_mapping = NameMapping::new(vec![
+                MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+                MappedField::new(Some(2), vec!["name".to_string()], vec![]),
+            ]);
+
+            let result = apply_name_mapping_to_arrow_schema(arrow_schema, &name_mapping).unwrap();
+
+            assert_eq!(get_field_id(result.field(0)), Some(1));
+            assert_eq!(get_field_id(result.field(1)), Some(2));
+        }
+
+        #[test]
+        fn test_apply_name_mapping_nested_struct() {
+            let location_fields = Fields::from(vec![
+                Field::new("lat", DataType::Float64, false),
+                Field::new("lon", DataType::Float64, false),
+            ]);
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("location", DataType::Struct(location_fields), true),
+            ]));
+
+            let name_mapping = NameMapping::new(vec![
+                MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+                MappedField::new(
+                    Some(2),
+                    vec!["location".to_string()],
+                    vec![
+                        MappedField::new(Some(3), vec!["lat".to_string()], vec![]),
+                        MappedField::new(Some(4), vec!["lon".to_string()], vec![]),
+                    ],
+                ),
+            ]);
+
+            let result = apply_name_mapping_to_arrow_schema(arrow_schema, &name_mapping).unwrap();
+
+            assert_eq!(get_field_id(result.field(0)), Some(1));
+            assert_eq!(get_field_id(result.field(1)), Some(2));
+
+            if let DataType::Struct(nested_fields) = result.field(1).data_type() {
+                assert_eq!(get_field_id(&nested_fields[0]), Some(3));
+                assert_eq!(get_field_id(&nested_fields[1]), Some(4));
+            } else {
+                panic!("Expected struct type");
+            }
+        }
+
+        #[test]
+        fn test_apply_name_mapping_list() {
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "tags",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+            ]));
+
+            let name_mapping = NameMapping::new(vec![
+                MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+                MappedField::new(
+                    Some(2),
+                    vec!["tags".to_string()],
+                    vec![MappedField::new(
+                        Some(3),
+                        vec!["element".to_string()],
+                        vec![],
+                    )],
+                ),
+            ]);
+
+            let result = apply_name_mapping_to_arrow_schema(arrow_schema, &name_mapping).unwrap();
+
+            assert_eq!(get_field_id(result.field(0)), Some(1));
+            assert_eq!(get_field_id(result.field(1)), Some(2));
+
+            if let DataType::List(element_field) = result.field(1).data_type() {
+                assert_eq!(get_field_id(element_field), Some(3));
+            } else {
+                panic!("Expected list type");
+            }
+        }
+
+        #[test]
+        fn test_apply_name_mapping_map() {
+            let map_entries = Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Utf8, true),
+                ])),
+                false,
+            ));
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("metadata", DataType::Map(map_entries, false), true),
+            ]));
+
+            let name_mapping = NameMapping::new(vec![
+                MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+                MappedField::new(
+                    Some(2),
+                    vec!["metadata".to_string()],
+                    vec![
+                        MappedField::new(Some(3), vec!["key".to_string()], vec![]),
+                        MappedField::new(Some(4), vec!["value".to_string()], vec![]),
+                    ],
+                ),
+            ]);
+
+            let result = apply_name_mapping_to_arrow_schema(arrow_schema, &name_mapping).unwrap();
+
+            assert_eq!(get_field_id(result.field(0)), Some(1));
+            assert_eq!(get_field_id(result.field(1)), Some(2));
+
+            if let DataType::Map(entries_field, _) = result.field(1).data_type() {
+                if let DataType::Struct(kv_fields) = entries_field.data_type() {
+                    assert_eq!(get_field_id(&kv_fields[0]), Some(3));
+                    assert_eq!(get_field_id(&kv_fields[1]), Some(4));
+                } else {
+                    panic!("Expected struct type for map entries");
+                }
+            } else {
+                panic!("Expected map type");
+            }
+        }
+
+        #[test]
+        fn test_apply_name_mapping_unmatched_fields() {
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("unknown", DataType::Utf8, true),
+            ]));
+
+            let name_mapping = NameMapping::new(vec![MappedField::new(
+                Some(1),
+                vec!["id".to_string()],
+                vec![],
+            )]);
+
+            let result = apply_name_mapping_to_arrow_schema(arrow_schema, &name_mapping).unwrap();
+
+            assert_eq!(get_field_id(result.field(0)), Some(1));
+            assert_eq!(get_field_id(result.field(1)), None);
+        }
+
+        #[test]
+        fn test_apply_name_mapping_deeply_nested() {
+            let inner_fields = Fields::from(vec![Field::new("value", DataType::Int32, false)]);
+            let data_fields = Fields::from(vec![Field::new(
+                "inner",
+                DataType::Struct(inner_fields),
+                false,
+            )]);
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "data",
+                DataType::Struct(data_fields),
+                false,
+            )]));
+
+            let name_mapping = NameMapping::new(vec![MappedField::new(
+                Some(1),
+                vec!["data".to_string()],
+                vec![MappedField::new(
+                    Some(2),
+                    vec!["inner".to_string()],
+                    vec![MappedField::new(Some(3), vec!["value".to_string()], vec![])],
+                )],
+            )]);
+
+            let result = apply_name_mapping_to_arrow_schema(arrow_schema, &name_mapping).unwrap();
+
+            assert_eq!(get_field_id(result.field(0)), Some(1));
+
+            if let DataType::Struct(data_fields) = result.field(0).data_type() {
+                assert_eq!(get_field_id(&data_fields[0]), Some(2));
+
+                if let DataType::Struct(inner_fields) = data_fields[0].data_type() {
+                    assert_eq!(get_field_id(&inner_fields[0]), Some(3));
+                } else {
+                    panic!("Expected struct type for inner");
+                }
+            } else {
+                panic!("Expected struct type for data");
+            }
+        }
+
+        #[test]
+        fn test_apply_name_mapping_list_of_structs() {
+            let item_fields = Fields::from(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("price", DataType::Float64, false),
+            ]);
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new(
+                    "element",
+                    DataType::Struct(item_fields),
+                    true,
+                ))),
+                true,
+            )]));
+
+            let name_mapping = NameMapping::new(vec![MappedField::new(
+                Some(1),
+                vec!["items".to_string()],
+                vec![MappedField::new(
+                    Some(2),
+                    vec!["element".to_string()],
+                    vec![
+                        MappedField::new(Some(3), vec!["name".to_string()], vec![]),
+                        MappedField::new(Some(4), vec!["price".to_string()], vec![]),
+                    ],
+                )],
+            )]);
+
+            let result = apply_name_mapping_to_arrow_schema(arrow_schema, &name_mapping).unwrap();
+
+            assert_eq!(get_field_id(result.field(0)), Some(1));
+
+            if let DataType::List(element_field) = result.field(0).data_type() {
+                assert_eq!(get_field_id(element_field), Some(2));
+
+                if let DataType::Struct(struct_fields) = element_field.data_type() {
+                    assert_eq!(get_field_id(&struct_fields[0]), Some(3));
+                    assert_eq!(get_field_id(&struct_fields[1]), Some(4));
+                } else {
+                    panic!("Expected struct type for list element");
+                }
+            } else {
+                panic!("Expected list type");
+            }
+        }
     }
 }
